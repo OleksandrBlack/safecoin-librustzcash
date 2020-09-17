@@ -1,12 +1,9 @@
-use criterion::criterion_main;
-mod bls12_381;
+#![feature(test)]
 
-criterion_main!(
-    bls12_381::benches,
-    bls12_381::ec::g1::benches,
-    bls12_381::ec::g2::benches,
-    bls12_381::fq::benches,
-    bls12_381::fq12::benches,
-    bls12_381::fq2::benches,
-    bls12_381::fr::benches,
-);
+extern crate ff;
+extern crate group;
+extern crate pairing;
+extern crate rand;
+extern crate test;
+
+mod bls12_381;

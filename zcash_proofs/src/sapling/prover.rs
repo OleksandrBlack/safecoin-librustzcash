@@ -4,14 +4,13 @@ use bellman::{
 };
 use ff::Field;
 use pairing::bls12_381::{Bls12, Fr};
-use rand_core::OsRng;
-use std::ops::{AddAssign, Neg};
+use rand_os::OsRng;
 use zcash_primitives::{
     jubjub::{edwards, fs::Fs, FixedGenerators, JubjubBls12, Unknown},
     primitives::{Diversifier, Note, PaymentAddress, ProofGenerationKey, ValueCommitment},
 };
 use zcash_primitives::{
-    merkle_tree::MerklePath,
+    merkle_tree::CommitmentTreeWitness,
     redjubjub::{PrivateKey, PublicKey, Signature},
     sapling::Node,
     transaction::components::Amount,
@@ -23,8 +22,7 @@ use crate::circuit::sapling::{Output, Spend};
 /// A context object for creating the Sapling components of a Zcash transaction.
 pub struct SaplingProvingContext {
     bsk: Fs,
-    // (sum of the Spend value commitments) - (sum of the Output value commitments)
-    cv_sum: edwards::Point<Bls12, Unknown>,
+    bvk: edwards::Point<Bls12, Unknown>,
 }
 
 impl SaplingProvingContext {
@@ -32,7 +30,7 @@ impl SaplingProvingContext {
     pub fn new() -> Self {
         SaplingProvingContext {
             bsk: Fs::zero(),
-            cv_sum: edwards::Point::zero(),
+            bvk: edwards::Point::zero(),
         }
     }
 
@@ -47,7 +45,7 @@ impl SaplingProvingContext {
         ar: Fs,
         value: u64,
         anchor: Fr,
-        merkle_path: MerklePath<Node>,
+        witness: CommitmentTreeWitness<Node>,
         proving_key: &Parameters<Bls12>,
         verifying_key: &PreparedVerifyingKey<Bls12>,
         params: &JubjubBls12,
@@ -67,7 +65,7 @@ impl SaplingProvingContext {
 
         // Accumulate the value commitment randomness in the context
         {
-            let mut tmp = rcv;
+            let mut tmp = rcv.clone();
             tmp.add_assign(&self.bsk);
 
             // Update the context
@@ -76,17 +74,18 @@ impl SaplingProvingContext {
 
         // Construct the value commitment
         let value_commitment = ValueCommitment::<Bls12> {
-            value,
+            value: value,
             randomness: rcv,
         };
 
         // Construct the viewing key
-        let viewing_key = proof_generation_key.to_viewing_key(params);
+        let viewing_key = proof_generation_key.into_viewing_key(params);
 
         // Construct the payment address with the viewing key / diversifier
-        let payment_address = viewing_key
-            .to_payment_address(diversifier, params)
-            .ok_or(())?;
+        let payment_address = match viewing_key.into_payment_address(diversifier, params) {
+            Some(p) => p,
+            None => return Err(()),
+        };
 
         // This is the result of the re-randomization, we compute it for the caller
         let rk = PublicKey::<Bls12>(proof_generation_key.ak.clone().into()).randomize(
@@ -97,15 +96,15 @@ impl SaplingProvingContext {
 
         // Let's compute the nullifier while we have the position
         let note = Note {
-            value,
+            value: value,
             g_d: diversifier
                 .g_d::<Bls12>(params)
                 .expect("was a valid diversifier before"),
-            pk_d: payment_address.pk_d().clone(),
+            pk_d: payment_address.pk_d.clone(),
             r: rcm,
         };
 
-        let nullifier = note.nf(&viewing_key, merkle_path.position, params);
+        let nullifier = note.nf(&viewing_key, witness.position, params);
 
         // We now have the full witness for our circuit
         let instance = Spend {
@@ -115,10 +114,10 @@ impl SaplingProvingContext {
             payment_address: Some(payment_address),
             commitment_randomness: Some(rcm),
             ar: Some(ar),
-            auth_path: merkle_path
+            auth_path: witness
                 .auth_path
                 .iter()
-                .map(|(node, b)| Some(((*node).into(), *b)))
+                .map(|n| n.map(|(node, b)| (node.into(), b)))
                 .collect(),
             anchor: Some(anchor),
         };
@@ -131,12 +130,12 @@ impl SaplingProvingContext {
         // Construct public input for circuit
         let mut public_input = [Fr::zero(); 7];
         {
-            let (x, y) = rk.0.to_xy();
+            let (x, y) = rk.0.into_xy();
             public_input[0] = x;
             public_input[1] = y;
         }
         {
-            let (x, y) = value_commitment.cm(params).to_xy();
+            let (x, y) = value_commitment.cm(params).into_xy();
             public_input[2] = x;
             public_input[3] = y;
         }
@@ -170,10 +169,10 @@ impl SaplingProvingContext {
         // Accumulate the value commitment in the context
         {
             let mut tmp = value_commitment.clone();
-            tmp = tmp.add(&self.cv_sum, params);
+            tmp = tmp.add(&self.bvk, params);
 
             // Update the context
-            self.cv_sum = tmp;
+            self.bvk = tmp;
         }
 
         Ok((proof, value_commitment, rk))
@@ -201,7 +200,8 @@ impl SaplingProvingContext {
 
         // Accumulate the value commitment randomness in the context
         {
-            let mut tmp = rcv.neg(); // Outputs subtract from the total.
+            let mut tmp = rcv.clone();
+            tmp.negate(); // Outputs subtract from the total.
             tmp.add_assign(&self.bsk);
 
             // Update the context
@@ -210,7 +210,7 @@ impl SaplingProvingContext {
 
         // Construct the value commitment for the proof instance
         let value_commitment = ValueCommitment::<Bls12> {
-            value,
+            value: value,
             randomness: rcv,
         };
 
@@ -220,7 +220,7 @@ impl SaplingProvingContext {
             value_commitment: Some(value_commitment.clone()),
             payment_address: Some(payment_address.clone()),
             commitment_randomness: Some(rcm),
-            esk: Some(esk),
+            esk: Some(esk.clone()),
         };
 
         // Create proof
@@ -234,10 +234,10 @@ impl SaplingProvingContext {
         {
             let mut tmp = value_commitment.clone();
             tmp = tmp.negate(); // Outputs subtract from the total.
-            tmp = tmp.add(&self.cv_sum, params);
+            tmp = tmp.add(&self.bvk, params);
 
             // Update the context
-            self.cv_sum = tmp;
+            self.bvk = tmp;
         }
 
         (proof, value_commitment)
@@ -261,15 +261,18 @@ impl SaplingProvingContext {
         let bvk = PublicKey::from_private(&bsk, FixedGenerators::ValueCommitmentRandomness, params);
 
         // In order to check internal consistency, let's use the accumulated value
-        // commitments (as the verifier would) and apply value_balance to compare
+        // commitments (as the verifier would) and apply valuebalance to compare
         // against our derived bvk.
         {
             // Compute value balance
-            let mut value_balance = compute_value_balance(value_balance, params).ok_or(())?;
+            let mut value_balance = match compute_value_balance(value_balance, params) {
+                Some(a) => a,
+                None => return Err(()),
+            };
 
-            // Subtract value_balance from cv_sum to get final bvk
+            // Subtract value_balance from current bvk to get final bvk
             value_balance = value_balance.negate();
-            let mut tmp = self.cv_sum.clone();
+            let mut tmp = self.bvk.clone();
             tmp = tmp.add(&value_balance, params);
 
             // The result should be the same, unless the provided valueBalance is wrong.

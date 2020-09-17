@@ -1,5 +1,3 @@
-//! Self-contained sub-circuit implementations for various primitives.
-
 pub mod test;
 
 pub mod blake2s;

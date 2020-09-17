@@ -1,6 +1,4 @@
-use ff::{BitIterator, Field, PrimeField};
-use std::ops::{AddAssign, MulAssign, Neg, SubAssign};
-use subtle::CtOption;
+use ff::{BitIterator, Field, PrimeField, PrimeFieldRepr, SqrtField};
 
 use super::{montgomery, JubjubEngine, JubjubParams, PrimeOrder, Unknown};
 
@@ -83,36 +81,33 @@ impl<E: JubjubEngine, Subgroup> PartialEq for Point<E, Subgroup> {
 }
 
 impl<E: JubjubEngine> Point<E, Unknown> {
-    pub fn read<R: Read>(mut reader: R, params: &E::Params) -> io::Result<Self> {
+    pub fn read<R: Read>(reader: R, params: &E::Params) -> io::Result<Self> {
         let mut y_repr = <E::Fr as PrimeField>::Repr::default();
-        reader.read_exact(y_repr.as_mut())?;
+        y_repr.read_le(reader)?;
 
-        let x_sign = (y_repr.as_ref()[31] >> 7) == 1;
-        y_repr.as_mut()[31] &= 0x7f;
+        let x_sign = (y_repr.as_ref()[3] >> 63) == 1;
+        y_repr.as_mut()[3] &= 0x7fffffffffffffff;
 
         match E::Fr::from_repr(y_repr) {
-            Some(y) => {
-                let p = Self::get_for_y(y, x_sign, params);
-                if bool::from(p.is_some()) {
-                    Ok(p.unwrap())
-                } else {
-                    Err(io::Error::new(io::ErrorKind::InvalidInput, "not on curve"))
-                }
-            }
-            None => Err(io::Error::new(
+            Ok(y) => match Self::get_for_y(y, x_sign, params) {
+                Some(p) => Ok(p),
+                None => Err(io::Error::new(io::ErrorKind::InvalidInput, "not on curve")),
+            },
+            Err(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "y is not in field",
             )),
         }
     }
 
-    pub fn get_for_y(y: E::Fr, sign: bool, params: &E::Params) -> CtOption<Self> {
+    pub fn get_for_y(y: E::Fr, sign: bool, params: &E::Params) -> Option<Self> {
         // Given a y on the curve, x^2 = (y^2 - 1) / (dy^2 + 1)
         // This is defined for all valid y-coordinates,
         // as dy^2 + 1 = 0 has no solution in Fr.
 
         // tmp1 = y^2
-        let mut tmp1 = y.square();
+        let mut tmp1 = y;
+        tmp1.square();
 
         // tmp2 = (y^2 * d) + 1
         let mut tmp2 = tmp1;
@@ -122,27 +117,33 @@ impl<E: JubjubEngine> Point<E, Unknown> {
         // tmp1 = y^2 - 1
         tmp1.sub_assign(&E::Fr::one());
 
-        tmp2.invert().and_then(|tmp2| {
-            // tmp1 = (y^2 - 1) / (dy^2 + 1)
-            tmp1.mul_assign(&tmp2);
+        match tmp2.inverse() {
+            Some(tmp2) => {
+                // tmp1 = (y^2 - 1) / (dy^2 + 1)
+                tmp1.mul_assign(&tmp2);
 
-            tmp1.sqrt().map(|mut x| {
-                if x.is_odd() != sign {
-                    x = x.neg();
+                match tmp1.sqrt() {
+                    Some(mut x) => {
+                        if x.into_repr().is_odd() != sign {
+                            x.negate();
+                        }
+
+                        let mut t = x;
+                        t.mul_assign(&y);
+
+                        Some(Point {
+                            x: x,
+                            y: y,
+                            t: t,
+                            z: E::Fr::one(),
+                            _marker: PhantomData,
+                        })
+                    }
+                    None => None,
                 }
-
-                let mut t = x;
-                t.mul_assign(&y);
-
-                Point {
-                    x,
-                    y,
-                    t,
-                    z: E::Fr::one(),
-                    _marker: PhantomData,
-                }
-            })
-        })
+            }
+            None => None,
+        }
     }
 
     /// This guarantees the point is in the prime order subgroup
@@ -158,31 +159,31 @@ impl<E: JubjubEngine> Point<E, Unknown> {
             let y = E::Fr::random(rng);
             let sign = rng.next_u32() % 2 != 0;
 
-            let p = Self::get_for_y(y, sign, params);
-            if bool::from(p.is_some()) {
-                return p.unwrap();
+            if let Some(p) = Self::get_for_y(y, sign, params) {
+                return p;
             }
         }
     }
 }
 
 impl<E: JubjubEngine, Subgroup> Point<E, Subgroup> {
-    pub fn write<W: Write>(&self, mut writer: W) -> io::Result<()> {
-        let (x, y) = self.to_xy();
+    pub fn write<W: Write>(&self, writer: W) -> io::Result<()> {
+        let (x, y) = self.into_xy();
 
         assert_eq!(E::Fr::NUM_BITS, 255);
 
-        let mut y_repr = y.to_repr();
-        if x.is_odd() {
-            y_repr.as_mut()[31] |= 0x80;
+        let x_repr = x.into_repr();
+        let mut y_repr = y.into_repr();
+        if x_repr.is_odd() {
+            y_repr.as_mut()[3] |= 0x8000000000000000u64;
         }
 
-        writer.write_all(y_repr.as_ref())
+        y_repr.write_le(writer)
     }
 
     /// Convert from a Montgomery point
     pub fn from_montgomery(m: &montgomery::Point<E, Subgroup>, params: &E::Params) -> Self {
-        match m.to_xy() {
+        match m.into_xy() {
             None => {
                 // Map the point at infinity to the neutral element.
                 Point::zero()
@@ -211,9 +212,12 @@ impl<E: JubjubEngine, Subgroup> Point<E, Subgroup> {
                 // only point of order 2 that is not the neutral element.
                 if y.is_zero() {
                     // This must be the point (0, 0) as above.
+                    let mut neg1 = E::Fr::one();
+                    neg1.negate();
+
                     Point {
                         x: E::Fr::zero(),
-                        y: E::Fr::one().neg(),
+                        y: neg1,
                         t: E::Fr::zero(),
                         z: E::Fr::one(),
                         _marker: PhantomData,
@@ -273,8 +277,8 @@ impl<E: JubjubEngine, Subgroup> Point<E, Subgroup> {
                     Point {
                         x: u,
                         y: v,
-                        t,
-                        z,
+                        t: t,
+                        z: z,
                         _marker: PhantomData,
                     }
                 }
@@ -302,9 +306,8 @@ impl<E: JubjubEngine, Subgroup> Point<E, Subgroup> {
         }
     }
 
-    /// Convert to affine coordinates
-    pub fn to_xy(&self) -> (E::Fr, E::Fr) {
-        let zinv = self.z.invert().unwrap();
+    pub fn into_xy(&self) -> (E::Fr, E::Fr) {
+        let zinv = self.z.inverse().unwrap();
 
         let mut x = self.x;
         x.mul_assign(&zinv);
@@ -319,8 +322,8 @@ impl<E: JubjubEngine, Subgroup> Point<E, Subgroup> {
     pub fn negate(&self) -> Self {
         let mut p = self.clone();
 
-        p.x = p.x.neg();
-        p.t = p.t.neg();
+        p.x.negate();
+        p.t.negate();
 
         p
     }
@@ -333,22 +336,27 @@ impl<E: JubjubEngine, Subgroup> Point<E, Subgroup> {
         //     http://hyperelliptic.org/EFD/g1p/auto-twisted-extended.html#doubling-dbl-2008-hwcd
 
         // A = X1^2
-        let a = self.x.square();
+        let mut a = self.x;
+        a.square();
 
         // B = Y1^2
-        let b = self.y.square();
+        let mut b = self.y;
+        b.square();
 
         // C = 2*Z1^2
-        let c = self.z.square().double();
+        let mut c = self.z;
+        c.square();
+        c.double();
 
         // D = a*A
         //   = -A
-        let d = a.neg();
+        let mut d = a;
+        d.negate();
 
         // E = (X1+Y1)^2 - A - B
         let mut e = self.x;
         e.add_assign(&self.y);
-        e = e.square();
+        e.square();
         e.add_assign(&d); // -A = D
         e.sub_assign(&b);
 
@@ -404,7 +412,7 @@ impl<E: JubjubEngine, Subgroup> Point<E, Subgroup> {
         b.mul_assign(&other.y);
 
         // C = d * t1 * t2
-        let mut c = *params.edwards_d();
+        let mut c = params.edwards_d().clone();
         c.mul_assign(&self.t);
         c.mul_assign(&other.t);
 
@@ -467,7 +475,7 @@ impl<E: JubjubEngine, Subgroup> Point<E, Subgroup> {
 
         let mut res = Self::zero();
 
-        for b in BitIterator::<u8, _>::new(scalar.into()) {
+        for b in BitIterator::new(scalar.into()) {
             res = res.double(params);
 
             if b {

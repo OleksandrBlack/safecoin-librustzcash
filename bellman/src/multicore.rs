@@ -1,13 +1,12 @@
-//! An interface for dealing with the kinds of parallel computations involved in
-//! `bellman`. It's currently just a thin wrapper around [`CpuPool`] and
-//! [`crossbeam`] but may be extended in the future to allow for various
-//! parallelism strategies.
-//!
-//! [`CpuPool`]: futures_cpupool::CpuPool
+//! This is an interface for dealing with the kinds of
+//! parallel computations involved in bellman. It's
+//! currently just a thin wrapper around CpuPool and
+//! crossbeam but may be extended in the future to
+//! allow for various parallelism strategies.
 
 #[cfg(feature = "multicore")]
 mod implementation {
-    use crossbeam::{self, thread::Scope};
+    use crossbeam::{self, Scope};
     use futures::{Future, IntoFuture, Poll};
     use futures_cpupool::{CpuFuture, CpuPool};
     use num_cpus;
@@ -24,7 +23,7 @@ mod implementation {
         // CPUs configured.
         pub(crate) fn new_with_cpus(cpus: usize) -> Worker {
             Worker {
-                cpus,
+                cpus: cpus,
                 pool: CpuPool::new(cpus),
             }
         }
@@ -60,9 +59,7 @@ mod implementation {
                 elements / self.cpus
             };
 
-            // TODO: Handle case where threads fail
             crossbeam::scope(|scope| f(scope, chunk_size))
-                .expect("Threads aren't allowed to fail yet")
         }
     }
 
@@ -155,8 +152,8 @@ mod implementation {
     pub struct DummyScope;
 
     impl DummyScope {
-        pub fn spawn<F: FnOnce(&DummyScope)>(&self, f: F) {
-            f(self);
+        pub fn spawn<F: FnOnce()>(&self, f: F) {
+            f();
         }
     }
 }

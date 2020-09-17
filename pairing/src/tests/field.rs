@@ -1,8 +1,29 @@
-use ff::{Field, PrimeField};
+use ff::{Field, LegendreSymbol, PrimeField, SqrtField};
 use rand_core::{RngCore, SeedableRng};
 use rand_xorshift::XorShiftRng;
 
-pub fn random_sqrt_tests<F: Field>() {
+pub fn random_frobenius_tests<F: Field, C: AsRef<[u64]>>(characteristic: C, maxpower: usize) {
+    let mut rng = XorShiftRng::from_seed([
+        0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06, 0xbc,
+        0xe5,
+    ]);
+
+    for _ in 0..100 {
+        for i in 0..(maxpower + 1) {
+            let mut a = F::random(&mut rng);
+            let mut b = a;
+
+            for _ in 0..i {
+                a = a.pow(&characteristic);
+            }
+            b.frobenius_map(i);
+
+            assert_eq!(a, b);
+        }
+    }
+}
+
+pub fn random_sqrt_tests<F: SqrtField>() {
     let mut rng = XorShiftRng::from_seed([
         0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06, 0xbc,
         0xe5,
@@ -10,22 +31,27 @@ pub fn random_sqrt_tests<F: Field>() {
 
     for _ in 0..10000 {
         let a = F::random(&mut rng);
-        let b = a.square();
+        let mut b = a;
+        b.square();
+        assert_eq!(b.legendre(), LegendreSymbol::QuadraticResidue);
 
         let b = b.sqrt().unwrap();
-        let negb = b.neg();
+        let mut negb = b;
+        negb.negate();
 
         assert!(a == b || a == negb);
     }
 
     let mut c = F::one();
     for _ in 0..10000 {
-        let mut b = c.square();
+        let mut b = c;
+        b.square();
+        assert_eq!(b.legendre(), LegendreSymbol::QuadraticResidue);
 
         b = b.sqrt().unwrap();
 
         if b != c {
-            b = b.neg();
+            b.negate();
         }
 
         assert_eq!(b, c);
@@ -51,11 +77,12 @@ pub fn random_field_tests<F: Field>() {
 
     assert!(F::zero().is_zero());
     {
-        let z = F::zero().neg();
+        let mut z = F::zero();
+        z.negate();
         assert!(z.is_zero());
     }
 
-    assert!(bool::from(F::zero().invert().is_none()));
+    assert!(F::zero().inverse().is_none());
 
     // Multiplication by zero
     {
@@ -98,7 +125,7 @@ pub fn from_str_tests<F: PrimeField>() {
             let n = rng.next_u64();
 
             let a = F::from_str(&format!("{}", n)).unwrap();
-            let b = F::from(n);
+            let b = F::from_repr(n.into()).unwrap();
 
             assert_eq!(a, b);
         }
@@ -177,7 +204,8 @@ fn random_subtraction_tests<F: Field, R: RngCore>(rng: &mut R) {
 fn random_negation_tests<F: Field, R: RngCore>(rng: &mut R) {
     for _ in 0..10000 {
         let a = F::random(rng);
-        let mut b = a.neg();
+        let mut b = a;
+        b.negate();
         b.add_assign(&a);
 
         assert!(b.is_zero());
@@ -186,24 +214,32 @@ fn random_negation_tests<F: Field, R: RngCore>(rng: &mut R) {
 
 fn random_doubling_tests<F: Field, R: RngCore>(rng: &mut R) {
     for _ in 0..10000 {
-        let a = F::random(rng);
-        assert_eq!(a + a, a.double());
+        let mut a = F::random(rng);
+        let mut b = a;
+        a.add_assign(&b);
+        b.double();
+
+        assert_eq!(a, b);
     }
 }
 
 fn random_squaring_tests<F: Field, R: RngCore>(rng: &mut R) {
     for _ in 0..10000 {
-        let a = F::random(rng);
-        assert_eq!(a * a, a.square());
+        let mut a = F::random(rng);
+        let mut b = a;
+        a.mul_assign(&b);
+        b.square();
+
+        assert_eq!(a, b);
     }
 }
 
 fn random_inversion_tests<F: Field, R: RngCore>(rng: &mut R) {
-    assert!(bool::from(F::zero().invert().is_none()));
+    assert!(F::zero().inverse().is_none());
 
     for _ in 0..10000 {
         let mut a = F::random(rng);
-        let b = a.invert().unwrap(); // probablistically nonzero
+        let b = a.inverse().unwrap(); // probablistically nonzero
         a.mul_assign(&b);
 
         assert_eq!(a, F::one());

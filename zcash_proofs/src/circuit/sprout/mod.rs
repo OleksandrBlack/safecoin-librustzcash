@@ -1,15 +1,3 @@
-//! The "hybrid Sprout" circuit.
-//!
-//! "Hybrid Sprout" refers to the implementation of the [Sprout statement] in
-//! `bellman` for [`groth16`], instead of the [original implementation][oldimpl]
-//! using [`libsnark`] for [BCTV14].
-//!
-//! [Sprout statement]: https://zips.z.cash/protocol/protocol.pdf#joinsplitstatement
-//! [`groth16`]: bellman::groth16
-//! [oldimpl]: https://github.com/zcash/zcash/tree/v2.0.7/src/zcash/circuit
-//! [`libsnark`]: https://github.com/scipr-lab/libsnark
-//! [BCTV14]: https://eprint.iacr.org/2013/879
-
 use bellman::gadgets::boolean::{AllocatedBit, Boolean};
 use bellman::gadgets::multipack::pack_into_inputs;
 use bellman::{Circuit, ConstraintSystem, LinearCombination, SynthesisError};
@@ -246,7 +234,10 @@ impl NoteValue {
             )?);
         }
 
-        Ok(NoteValue { value, bits })
+        Ok(NoteValue {
+            value: value,
+            bits: bits,
+        })
     }
 
     /// Encodes the bits of the value into little-endian
@@ -256,7 +247,7 @@ impl NoteValue {
             .chunks(8)
             .flat_map(|v| v.iter().rev())
             .cloned()
-            .map(Boolean::from)
+            .map(|e| Boolean::from(e))
             .collect()
     }
 
@@ -268,7 +259,7 @@ impl NoteValue {
         let mut coeff = E::Fr::one();
         for b in &self.bits {
             tmp = tmp + (coeff, b.get_variable());
-            coeff = coeff.double();
+            coeff.double();
         }
 
         tmp
@@ -335,7 +326,6 @@ where
 }
 
 #[test]
-#[ignore]
 fn test_sprout_constraints() {
     use bellman::gadgets::test::*;
     use pairing::bls12_381::Bls12;
@@ -389,11 +379,11 @@ fn test_sprout_constraints() {
             let a_sk = Some(SpendingKey(get_u256(&mut test_vector)));
 
             inputs.push(JSInput {
-                value,
-                a_sk,
-                rho,
-                r,
-                auth_path,
+                value: value,
+                a_sk: a_sk,
+                rho: rho,
+                r: r,
+                auth_path: auth_path,
             });
         }
 
@@ -405,7 +395,11 @@ fn test_sprout_constraints() {
             get_u256(&mut test_vector);
             let r = Some(CommitmentRandomness(get_u256(&mut test_vector)));
 
-            outputs.push(JSOutput { value, a_pk, r });
+            outputs.push(JSOutput {
+                value: value,
+                a_pk: a_pk,
+                r: r,
+            });
         }
 
         let vpub_old = Some(test_vector.read_u64::<LittleEndian>().unwrap());
@@ -421,13 +415,13 @@ fn test_sprout_constraints() {
         let mac2 = get_u256(&mut test_vector);
 
         let js = JoinSplit {
-            vpub_old,
-            vpub_new,
-            h_sig,
-            phi,
-            inputs,
-            outputs,
-            rt,
+            vpub_old: vpub_old,
+            vpub_new: vpub_new,
+            h_sig: h_sig,
+            phi: phi,
+            inputs: inputs,
+            outputs: outputs,
+            rt: rt,
         };
 
         js.synthesize(&mut cs).unwrap();

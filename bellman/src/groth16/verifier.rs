@@ -1,15 +1,16 @@
 use ff::PrimeField;
 use group::{CurveAffine, CurveProjective};
 use pairing::{Engine, PairingCurveAffine};
-use std::ops::{AddAssign, Neg};
 
 use super::{PreparedVerifyingKey, Proof, VerifyingKey};
 
-use crate::SynthesisError;
+use SynthesisError;
 
 pub fn prepare_verifying_key<E: Engine>(vk: &VerifyingKey<E>) -> PreparedVerifyingKey<E> {
-    let gamma = vk.gamma_g2.neg();
-    let delta = vk.delta_g2.neg();
+    let mut gamma = vk.gamma_g2;
+    gamma.negate();
+    let mut delta = vk.delta_g2;
+    delta.negate();
 
     PreparedVerifyingKey {
         alpha_g1_beta_g2: E::pairing(vk.alpha_g1, vk.beta_g2),
@@ -31,7 +32,7 @@ pub fn verify_proof<'a, E: Engine>(
     let mut acc = pvk.ic[0].into_projective();
 
     for (i, b) in public_inputs.iter().zip(pvk.ic.iter().skip(1)) {
-        AddAssign::<&E::G1>::add_assign(&mut acc, &b.mul(i.to_repr()));
+        acc.add_assign(&b.mul(i.into_repr()));
     }
 
     // The original verification equation is:
@@ -48,7 +49,7 @@ pub fn verify_proof<'a, E: Engine>(
             (&acc.into_affine().prepare(), &pvk.neg_gamma_g2),
             (&proof.c.prepare(), &pvk.neg_delta_g2),
         ]
-        .iter(),
+        .into_iter(),
     ))
     .unwrap()
         == pvk.alpha_g1_beta_g2)

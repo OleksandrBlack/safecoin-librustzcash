@@ -1,3 +1,8 @@
+extern crate bellman;
+extern crate ff;
+extern crate pairing;
+extern crate rand;
+
 // For randomness (during paramgen and proof generation)
 use rand::thread_rng;
 
@@ -7,7 +12,6 @@ use std::time::{Duration, Instant};
 // Bring in some tools for using pairing-friendly curves
 use ff::{Field, ScalarEngine};
 use pairing::Engine;
-use std::ops::{AddAssign, MulAssign};
 
 // We're going to use the BLS12-381 pairing-friendly elliptic curve.
 use pairing::bls12_381::Bls12;
@@ -41,7 +45,8 @@ fn mimc<E: Engine>(mut xl: E::Fr, mut xr: E::Fr, constants: &[E::Fr]) -> E::Fr {
     for i in 0..MIMC_ROUNDS {
         let mut tmp1 = xl;
         tmp1.add_assign(&constants[i]);
-        let mut tmp2 = tmp1.square();
+        let mut tmp2 = tmp1;
+        tmp2.square();
         tmp2.mul_assign(&tmp1);
         tmp2.add_assign(&xr);
         xr = xl;
@@ -85,11 +90,12 @@ impl<'a, E: Engine> Circuit<E> for MiMCDemo<'a, E> {
             let cs = &mut cs.namespace(|| format!("round {}", i));
 
             // tmp = (xL + Ci)^2
-            let tmp_value = xl_value.map(|mut e| {
+            let mut tmp_value = xl_value.map(|mut e| {
                 e.add_assign(&self.constants[i]);
-                e.square()
+                e.square();
+                e
             });
-            let tmp = cs.alloc(
+            let mut tmp = cs.alloc(
                 || "tmp",
                 || tmp_value.ok_or(SynthesisError::AssignmentMissing),
             )?;
@@ -104,14 +110,14 @@ impl<'a, E: Engine> Circuit<E> for MiMCDemo<'a, E> {
             // new_xL = xR + (xL + Ci)^3
             // new_xL = xR + tmp * (xL + Ci)
             // new_xL - xR = tmp * (xL + Ci)
-            let new_xl_value = xl_value.map(|mut e| {
+            let mut new_xl_value = xl_value.map(|mut e| {
                 e.add_assign(&self.constants[i]);
                 e.mul_assign(&tmp_value.unwrap());
                 e.add_assign(&xr_value.unwrap());
                 e
             });
 
-            let new_xl = if i == (MIMC_ROUNDS - 1) {
+            let mut new_xl = if i == (MIMC_ROUNDS - 1) {
                 // This is the last round, xL is our image and so
                 // we allocate a public input.
                 cs.alloc_input(

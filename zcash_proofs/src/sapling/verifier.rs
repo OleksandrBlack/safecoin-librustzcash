@@ -18,15 +18,14 @@ fn is_small_order<Order>(p: &edwards::Point<Bls12, Order>, params: &JubjubBls12)
 
 /// A context object for verifying the Sapling components of a Zcash transaction.
 pub struct SaplingVerificationContext {
-    // (sum of the Spend value commitments) - (sum of the Output value commitments)
-    cv_sum: edwards::Point<Bls12, Unknown>,
+    bvk: edwards::Point<Bls12, Unknown>,
 }
 
 impl SaplingVerificationContext {
     /// Construct a new context to be used with a single transaction.
     pub fn new() -> Self {
         SaplingVerificationContext {
-            cv_sum: edwards::Point::zero(),
+            bvk: edwards::Point::zero(),
         }
     }
 
@@ -55,10 +54,10 @@ impl SaplingVerificationContext {
         // Accumulate the value commitment in the context
         {
             let mut tmp = cv.clone();
-            tmp = tmp.add(&self.cv_sum, params);
+            tmp = tmp.add(&self.bvk, params);
 
             // Update the context
-            self.cv_sum = tmp;
+            self.bvk = tmp;
         }
 
         // Grab the nullifier as a sequence of bytes
@@ -83,12 +82,12 @@ impl SaplingVerificationContext {
         // Construct public input for circuit
         let mut public_input = [Fr::zero(); 7];
         {
-            let (x, y) = rk.0.to_xy();
+            let (x, y) = rk.0.into_xy();
             public_input[0] = x;
             public_input[1] = y;
         }
         {
-            let (x, y) = cv.to_xy();
+            let (x, y) = cv.into_xy();
             public_input[2] = x;
             public_input[3] = y;
         }
@@ -138,21 +137,21 @@ impl SaplingVerificationContext {
         {
             let mut tmp = cv.clone();
             tmp = tmp.negate(); // Outputs subtract from the total.
-            tmp = tmp.add(&self.cv_sum, params);
+            tmp = tmp.add(&self.bvk, params);
 
             // Update the context
-            self.cv_sum = tmp;
+            self.bvk = tmp;
         }
 
         // Construct public input for circuit
         let mut public_input = [Fr::zero(); 5];
         {
-            let (x, y) = cv.to_xy();
+            let (x, y) = cv.into_xy();
             public_input[0] = x;
             public_input[1] = y;
         }
         {
-            let (x, y) = epk.to_xy();
+            let (x, y) = epk.into_xy();
             public_input[2] = x;
             public_input[3] = y;
         }
@@ -178,8 +177,8 @@ impl SaplingVerificationContext {
         binding_sig: Signature,
         params: &JubjubBls12,
     ) -> bool {
-        // Obtain current cv_sum from the context
-        let mut bvk = PublicKey(self.cv_sum.clone());
+        // Obtain current bvk from the context
+        let mut bvk = PublicKey(self.bvk.clone());
 
         // Compute value balance
         let mut value_balance = match compute_value_balance(value_balance, params) {
@@ -187,7 +186,7 @@ impl SaplingVerificationContext {
             None => return false,
         };
 
-        // Subtract value_balance from current cv_sum to get final bvk
+        // Subtract value_balance from current bvk to get final bvk
         value_balance = value_balance.negate();
         bvk.0 = bvk.0.add(&value_balance, params);
 

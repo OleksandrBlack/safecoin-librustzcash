@@ -11,17 +11,16 @@ use crate::{
 use blake2b_simd::{Hash as Blake2bHash, Params as Blake2bParams};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crypto_api_chachapoly::{ChaCha20Ietf, ChachaPolyIetf};
-use ff::PrimeField;
+use ff::{PrimeField, PrimeFieldRepr};
 use pairing::bls12_381::{Bls12, Fr};
 use rand_core::{CryptoRng, RngCore};
-use std::convert::TryInto;
 use std::fmt;
 use std::str;
 
 use crate::{keys::OutgoingViewingKey, JUBJUB};
 
-pub const KDF_SAPLING_PERSONALIZATION: &[u8; 16] = b"Zcash_SaplingKDF";
-pub const PRF_OCK_PERSONALIZATION: &[u8; 16] = b"Zcash_Derive_ock";
+pub const KDF_SAPLING_PERSONALIZATION: &'static [u8; 16] = b"Zcash_SaplingKDF";
+pub const PRF_OCK_PERSONALIZATION: &'static [u8; 16] = b"Zcash_Derive_ock";
 
 const COMPACT_NOTE_SIZE: usize = (
     1  + // version
@@ -86,7 +85,7 @@ impl Default for Memo {
 
 impl PartialEq for Memo {
     fn eq(&self, rhs: &Memo) -> bool {
-        self.0[..] == rhs.0[..]
+        &self.0[..] == &rhs.0[..]
     }
 }
 
@@ -105,6 +104,11 @@ impl Memo {
             // memo is too long
             None
         }
+    }
+
+    /// Returns a `Memo` containing the given string, or `None` if the string is too long.
+    pub fn from_str(memo: &str) -> Option<Memo> {
+        Memo::from_bytes(memo.as_bytes())
     }
 
     /// Returns the underlying bytes of the `Memo`.
@@ -127,15 +131,6 @@ impl Memo {
         } else {
             None
         }
-    }
-}
-
-impl str::FromStr for Memo {
-    type Err = ();
-
-    /// Returns a `Memo` containing the given string, or an error if the string is too long.
-    fn from_str(memo: &str) -> Result<Self, Self::Err> {
-        Memo::from_bytes(memo.as_bytes()).ok_or(())
     }
 }
 
@@ -193,7 +188,7 @@ fn prf_ock(
     let mut ock_input = [0u8; 128];
     ock_input[0..32].copy_from_slice(&ovk.0);
     cv.write(&mut ock_input[32..64]).unwrap();
-    ock_input[64..96].copy_from_slice(cmu.to_repr().as_ref());
+    cmu.into_repr().write_le(&mut ock_input[64..96]).unwrap();
     epk.write(&mut ock_input[96..128]).unwrap();
 
     Blake2bParams::new()
@@ -215,12 +210,12 @@ fn prf_ock(
 /// ```
 /// extern crate ff;
 /// extern crate pairing;
-/// extern crate rand_core;
+/// extern crate rand_os;
 /// extern crate zcash_primitives;
 ///
 /// use ff::Field;
 /// use pairing::bls12_381::Bls12;
-/// use rand_core::OsRng;
+/// use rand_os::OsRng;
 /// use zcash_primitives::{
 ///     jubjub::fs::Fs,
 ///     keys::OutgoingViewingKey,
@@ -233,7 +228,10 @@ fn prf_ock(
 ///
 /// let diversifier = Diversifier([0; 11]);
 /// let pk_d = diversifier.g_d::<Bls12>(&JUBJUB).unwrap();
-/// let to = PaymentAddress::from_parts(diversifier, pk_d).unwrap();
+/// let to = PaymentAddress {
+///     pk_d,
+///     diversifier,
+/// };
 /// let ovk = OutgoingViewingKey([0; 32]);
 ///
 /// let value = 1000;
@@ -292,18 +290,22 @@ impl SaplingNoteEncryption {
 
     /// Generates `encCiphertext` for this note.
     pub fn encrypt_note_plaintext(&self) -> [u8; ENC_CIPHERTEXT_SIZE] {
-        let shared_secret = sapling_ka_agree(&self.esk, self.to.pk_d());
+        let shared_secret = sapling_ka_agree(&self.esk, &self.to.pk_d);
         let key = kdf_sapling(shared_secret, &self.epk);
 
         // Note plaintext encoding is defined in section 5.5 of the Zcash Protocol
         // Specification.
         let mut input = [0; NOTE_PLAINTEXT_SIZE];
         input[0] = 1;
-        input[1..12].copy_from_slice(&self.to.diversifier().0);
+        input[1..12].copy_from_slice(&self.to.diversifier.0);
         (&mut input[12..20])
             .write_u64::<LittleEndian>(self.note.value)
             .unwrap();
-        input[20..COMPACT_NOTE_SIZE].copy_from_slice(self.note.r.to_repr().as_ref());
+        self.note
+            .r
+            .into_repr()
+            .write_le(&mut input[20..COMPACT_NOTE_SIZE])
+            .unwrap();
         input[COMPACT_NOTE_SIZE..NOTE_PLAINTEXT_SIZE].copy_from_slice(&self.memo.0);
 
         let mut output = [0u8; ENC_CIPHERTEXT_SIZE];
@@ -327,7 +329,10 @@ impl SaplingNoteEncryption {
 
         let mut input = [0u8; OUT_PLAINTEXT_SIZE];
         self.note.pk_d.write(&mut input[0..32]).unwrap();
-        input[32..OUT_PLAINTEXT_SIZE].copy_from_slice(self.esk.to_repr().as_ref());
+        self.esk
+            .into_repr()
+            .write_le(&mut input[32..OUT_PLAINTEXT_SIZE])
+            .unwrap();
 
         let mut output = [0u8; OUT_CIPHERTEXT_SIZE];
         assert_eq!(
@@ -357,18 +362,16 @@ fn parse_note_plaintext_without_memo(
 
     let v = (&plaintext[12..20]).read_u64::<LittleEndian>().ok()?;
 
-    let rcm = Fs::from_repr(FsRepr(
-        plaintext[20..COMPACT_NOTE_SIZE]
-            .try_into()
-            .expect("slice is the correct length"),
-    ))?;
+    let mut rcm = FsRepr::default();
+    rcm.read_le(&plaintext[20..COMPACT_NOTE_SIZE]).ok()?;
+    let rcm = Fs::from_repr(rcm).ok()?;
 
     let diversifier = Diversifier(d);
     let pk_d = diversifier
         .g_d::<Bls12>(&JUBJUB)?
-        .mul(ivk.to_repr(), &JUBJUB);
+        .mul(ivk.into_repr(), &JUBJUB);
 
-    let to = PaymentAddress::from_parts(diversifier, pk_d)?;
+    let to = PaymentAddress { pk_d, diversifier };
     let note = to.create_note(v, rcm, &JUBJUB).unwrap();
 
     if note.cm(&JUBJUB) != *cmu {
@@ -479,11 +482,9 @@ pub fn try_sapling_output_recovery(
         .ok()?
         .as_prime_order(&JUBJUB)?;
 
-    let esk = Fs::from_repr(FsRepr(
-        op[32..OUT_PLAINTEXT_SIZE]
-            .try_into()
-            .expect("slice is the correct length"),
-    ))?;
+    let mut esk = FsRepr::default();
+    esk.read_le(&op[32..OUT_PLAINTEXT_SIZE]).ok()?;
+    let esk = Fs::from_repr(esk).ok()?;
 
     let shared_secret = sapling_ka_agree(&esk, &pk_d);
     let key = kdf_sapling(shared_secret, &epk);
@@ -513,11 +514,9 @@ pub fn try_sapling_output_recovery(
 
     let v = (&plaintext[12..20]).read_u64::<LittleEndian>().ok()?;
 
-    let rcm = Fs::from_repr(FsRepr(
-        plaintext[20..COMPACT_NOTE_SIZE]
-            .try_into()
-            .expect("slice is the correct length"),
-    ))?;
+    let mut rcm = FsRepr::default();
+    rcm.read_le(&plaintext[20..COMPACT_NOTE_SIZE]).ok()?;
+    let rcm = Fs::from_repr(rcm).ok()?;
 
     let mut memo = [0u8; 512];
     memo.copy_from_slice(&plaintext[COMPACT_NOTE_SIZE..NOTE_PLAINTEXT_SIZE]);
@@ -525,14 +524,14 @@ pub fn try_sapling_output_recovery(
     let diversifier = Diversifier(d);
     if diversifier
         .g_d::<Bls12>(&JUBJUB)?
-        .mul(esk.to_repr(), &JUBJUB)
+        .mul(esk.into_repr(), &JUBJUB)
         != *epk
     {
         // Published epk doesn't match calculated epk
         return None;
     }
 
-    let to = PaymentAddress::from_parts(diversifier, pk_d)?;
+    let to = PaymentAddress { pk_d, diversifier };
     let note = to.create_note(v, rcm, &JUBJUB).unwrap();
 
     if note.cm(&JUBJUB) != *cmu {
@@ -554,12 +553,10 @@ mod tests {
         primitives::{Diversifier, PaymentAddress, ValueCommitment},
     };
     use crypto_api_chachapoly::ChachaPolyIetf;
-    use ff::{Field, PrimeField};
+    use ff::{Field, PrimeField, PrimeFieldRepr};
     use pairing::bls12_381::{Bls12, Fr, FrRepr};
-    use rand_core::OsRng;
     use rand_core::{CryptoRng, RngCore};
-    use std::convert::TryInto;
-    use std::str::FromStr;
+    use rand_os::OsRng;
 
     use super::{
         kdf_sapling, prf_ock, sapling_ka_agree, try_sapling_compact_note_decryption,
@@ -664,18 +661,16 @@ mod tests {
                 0x74, 0x20, 0x65, 0x6e, 0x6f, 0x75, 0x67, 0x68
             ])
         );
-        assert_eq!(
-            Memo::from_str(
-                "thiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiis \
-                 iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiis \
-                 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-                 veeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeryyyyyyyyyyyyyyyyyyyyyyyyyy \
-                 looooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooong \
-                 meeeeeeeeeeeeeeeeeeemooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo \
-                 but it's now a bit too long"
-            ),
-            Err(())
-        );
+        assert!(Memo::from_str(
+            "thiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiis \
+             iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiis \
+             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+             veeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeryyyyyyyyyyyyyyyyyyyyyyyyyy \
+             looooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooong \
+             meeeeeeeeeeeeeeeeeeemooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo \
+             but it's now a bit too long"
+        )
+        .is_none());
     }
 
     #[test]
@@ -696,47 +691,10 @@ mod tests {
         [u8; ENC_CIPHERTEXT_SIZE],
         [u8; OUT_CIPHERTEXT_SIZE],
     ) {
-        let ivk = Fs::random(&mut rng);
-
-        let (ovk, ivk, cv, cmu, epk, enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext_with(ivk, rng);
-
-        assert!(try_sapling_note_decryption(&ivk, &epk, &cmu, &enc_ciphertext).is_some());
-        assert!(try_sapling_compact_note_decryption(
-            &ivk,
-            &epk,
-            &cmu,
-            &enc_ciphertext[..COMPACT_NOTE_SIZE]
-        )
-        .is_some());
-        assert!(try_sapling_output_recovery(
-            &ovk,
-            &cv,
-            &cmu,
-            &epk,
-            &enc_ciphertext,
-            &out_ciphertext
-        )
-        .is_some());
-
-        (ovk, ivk, cv, cmu, epk, enc_ciphertext, out_ciphertext)
-    }
-
-    fn random_enc_ciphertext_with<R: RngCore + CryptoRng>(
-        ivk: Fs,
-        mut rng: &mut R,
-    ) -> (
-        OutgoingViewingKey,
-        Fs,
-        edwards::Point<Bls12, Unknown>,
-        Fr,
-        edwards::Point<Bls12, PrimeOrder>,
-        [u8; ENC_CIPHERTEXT_SIZE],
-        [u8; OUT_CIPHERTEXT_SIZE],
-    ) {
         let diversifier = Diversifier([0; 11]);
+        let ivk = Fs::random(&mut rng);
         let pk_d = diversifier.g_d::<Bls12>(&JUBJUB).unwrap().mul(ivk, &JUBJUB);
-        let pa = PaymentAddress::from_parts_unchecked(diversifier, pk_d);
+        let pa = PaymentAddress { diversifier, pk_d };
 
         // Construct the value commitment for the proof instance
         let value = 100;
@@ -756,6 +714,24 @@ mod tests {
         let epk = ne.epk();
         let enc_ciphertext = ne.encrypt_note_plaintext();
         let out_ciphertext = ne.encrypt_outgoing_plaintext(&cv, &cmu);
+
+        assert!(try_sapling_note_decryption(&ivk, epk, &cmu, &enc_ciphertext).is_some());
+        assert!(try_sapling_compact_note_decryption(
+            &ivk,
+            epk,
+            &cmu,
+            &enc_ciphertext[..COMPACT_NOTE_SIZE]
+        )
+        .is_some());
+        assert!(try_sapling_output_recovery(
+            &ovk,
+            &cv,
+            &cmu,
+            &epk,
+            &enc_ciphertext,
+            &out_ciphertext
+        )
+        .is_some());
 
         (
             ovk,
@@ -792,7 +768,9 @@ mod tests {
             .as_prime_order(&JUBJUB)
             .unwrap();
 
-        let esk = Fs::from_repr(FsRepr(op[32..OUT_PLAINTEXT_SIZE].try_into().unwrap())).unwrap();
+        let mut esk = FsRepr::default();
+        esk.read_le(&op[32..OUT_PLAINTEXT_SIZE]).unwrap();
+        let esk = Fs::from_repr(esk).unwrap();
 
         let shared_secret = sapling_ka_agree(&esk, &pk_d);
         let key = kdf_sapling(shared_secret, &epk);
@@ -1272,32 +1250,22 @@ mod tests {
     }
 
     #[test]
-    fn recovery_with_invalid_pk_d() {
-        let mut rng = OsRng;
-
-        let ivk = Fs::zero();
-        let (ovk, _, cv, cmu, epk, enc_ciphertext, out_ciphertext) =
-            random_enc_ciphertext_with(ivk, &mut rng);
-
-        assert_eq!(
-            try_sapling_output_recovery(&ovk, &cv, &cmu, &epk, &enc_ciphertext, &out_ciphertext),
-            None
-        );
-    }
-
-    #[test]
     fn test_vectors() {
         let test_vectors = crate::test_vectors::note_encryption::make_test_vectors();
 
         macro_rules! read_fr {
             ($field:expr) => {{
-                Fr::from_repr(FrRepr($field[..].try_into().unwrap())).unwrap()
+                let mut repr = FrRepr::default();
+                repr.read_le(&$field[..]).unwrap();
+                Fr::from_repr(repr).unwrap()
             }};
         }
 
         macro_rules! read_fs {
             ($field:expr) => {{
-                Fs::from_repr(FsRepr($field[..].try_into().unwrap())).unwrap()
+                let mut repr = FsRepr::default();
+                repr.read_le(&$field[..]).unwrap();
+                Fs::from_repr(repr).unwrap()
             }};
         }
 
@@ -1342,7 +1310,10 @@ mod tests {
             let ock = prf_ock(&ovk, &cv, &cmu, &epk);
             assert_eq!(ock.as_bytes(), tv.ock);
 
-            let to = PaymentAddress::from_parts(Diversifier(tv.default_d), pk_d).unwrap();
+            let to = PaymentAddress {
+                pk_d,
+                diversifier: Diversifier(tv.default_d),
+            };
             let note = to.create_note(tv.v, rcm, &JUBJUB).unwrap();
             assert_eq!(note.cm(&JUBJUB), cmu);
 

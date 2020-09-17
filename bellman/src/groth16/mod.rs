@@ -1,14 +1,10 @@
-//! The [Groth16] proving system.
-//!
-//! [Groth16]: https://eprint.iacr.org/2016/260
-
 use group::{CurveAffine, EncodedPoint};
 use pairing::{Engine, PairingCurveAffine};
 
-use crate::SynthesisError;
+use SynthesisError;
 
-use crate::multiexp::SourceBuilder;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use multiexp::SourceBuilder;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
@@ -94,7 +90,7 @@ impl<E: Engine> Proof<E> {
                 }
             })?;
 
-        Ok(Proof { a, b, c })
+        Ok(Proof { a: a, b: b, c: c })
     }
 }
 
@@ -212,13 +208,13 @@ impl<E: Engine> VerifyingKey<E> {
         }
 
         Ok(VerifyingKey {
-            alpha_g1,
-            beta_g1,
-            beta_g2,
-            gamma_g2,
-            delta_g1,
-            delta_g2,
-            ic,
+            alpha_g1: alpha_g1,
+            beta_g1: beta_g1,
+            beta_g2: beta_g2,
+            gamma_g2: gamma_g2,
+            delta_g1: delta_g1,
+            delta_g2: delta_g2,
+            ic: ic,
         })
     }
 }
@@ -380,7 +376,7 @@ impl<E: Engine> Parameters<E> {
         }
 
         Ok(Parameters {
-            vk,
+            vk: vk,
             h: Arc::new(h),
             l: Arc::new(l),
             a: Arc::new(a),
@@ -469,12 +465,11 @@ impl<'a, E: Engine> ParameterSource<E> for &'a Parameters<E> {
 #[cfg(test)]
 mod test_with_bls12_381 {
     use super::*;
-    use crate::{Circuit, ConstraintSystem, SynthesisError};
+    use {Circuit, ConstraintSystem, SynthesisError};
 
     use ff::Field;
     use pairing::bls12_381::{Bls12, Fr};
     use rand::thread_rng;
-    use std::ops::MulAssign;
 
     #[test]
     fn serialization() {

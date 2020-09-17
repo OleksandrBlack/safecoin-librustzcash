@@ -1,22 +1,22 @@
 use rand_core::RngCore;
-use std::ops::{AddAssign, MulAssign};
+
 use std::sync::Arc;
 
 use futures::Future;
 
-use ff::Field;
+use ff::{Field, PrimeField};
 use group::{CurveAffine, CurveProjective};
 use pairing::Engine;
 
 use super::{ParameterSource, Proof};
 
-use crate::{Circuit, ConstraintSystem, Index, LinearCombination, SynthesisError, Variable};
+use {Circuit, ConstraintSystem, Index, LinearCombination, SynthesisError, Variable};
 
-use crate::domain::{EvaluationDomain, Scalar};
+use domain::{EvaluationDomain, Scalar};
 
-use crate::multiexp::{multiexp, DensityTracker, FullDensity};
+use multiexp::{multiexp, DensityTracker, FullDensity};
 
-use crate::multicore::Worker;
+use multicore::Worker;
 
 fn eval<E: Engine>(
     lc: &LinearCombination<E>,
@@ -229,14 +229,26 @@ where
         let a_len = a.len() - 1;
         a.truncate(a_len);
         // TODO: parallelize if it's even helpful
-        let a = Arc::new(a.into_iter().map(|s| s.0).collect::<Vec<_>>());
+        let a = Arc::new(a.into_iter().map(|s| s.0.into_repr()).collect::<Vec<_>>());
 
         multiexp(&worker, params.get_h(a.len())?, FullDensity, a)
     };
 
     // TODO: parallelize if it's even helpful
-    let input_assignment = Arc::new(prover.input_assignment);
-    let aux_assignment = Arc::new(prover.aux_assignment);
+    let input_assignment = Arc::new(
+        prover
+            .input_assignment
+            .into_iter()
+            .map(|s| s.into_repr())
+            .collect::<Vec<_>>(),
+    );
+    let aux_assignment = Arc::new(
+        prover
+            .aux_assignment
+            .into_iter()
+            .map(|s| s.into_repr())
+            .collect::<Vec<_>>(),
+    );
 
     let l = multiexp(
         &worker,
@@ -302,34 +314,34 @@ where
     }
 
     let mut g_a = vk.delta_g1.mul(r);
-    AddAssign::<&E::G1Affine>::add_assign(&mut g_a, &vk.alpha_g1);
+    g_a.add_assign_mixed(&vk.alpha_g1);
     let mut g_b = vk.delta_g2.mul(s);
-    AddAssign::<&E::G2Affine>::add_assign(&mut g_b, &vk.beta_g2);
+    g_b.add_assign_mixed(&vk.beta_g2);
     let mut g_c;
     {
         let mut rs = r;
         rs.mul_assign(&s);
 
         g_c = vk.delta_g1.mul(rs);
-        AddAssign::<&E::G1>::add_assign(&mut g_c, &vk.alpha_g1.mul(s));
-        AddAssign::<&E::G1>::add_assign(&mut g_c, &vk.beta_g1.mul(r));
+        g_c.add_assign(&vk.alpha_g1.mul(s));
+        g_c.add_assign(&vk.beta_g1.mul(r));
     }
     let mut a_answer = a_inputs.wait()?;
-    AddAssign::<&E::G1>::add_assign(&mut a_answer, &a_aux.wait()?);
-    AddAssign::<&E::G1>::add_assign(&mut g_a, &a_answer);
+    a_answer.add_assign(&a_aux.wait()?);
+    g_a.add_assign(&a_answer);
     a_answer.mul_assign(s);
-    AddAssign::<&E::G1>::add_assign(&mut g_c, &a_answer);
+    g_c.add_assign(&a_answer);
 
-    let mut b1_answer: E::G1 = b_g1_inputs.wait()?;
-    AddAssign::<&E::G1>::add_assign(&mut b1_answer, &b_g1_aux.wait()?);
+    let mut b1_answer = b_g1_inputs.wait()?;
+    b1_answer.add_assign(&b_g1_aux.wait()?);
     let mut b2_answer = b_g2_inputs.wait()?;
-    AddAssign::<&E::G2>::add_assign(&mut b2_answer, &b_g2_aux.wait()?);
+    b2_answer.add_assign(&b_g2_aux.wait()?);
 
-    AddAssign::<&E::G2>::add_assign(&mut g_b, &b2_answer);
+    g_b.add_assign(&b2_answer);
     b1_answer.mul_assign(r);
-    AddAssign::<&E::G1>::add_assign(&mut g_c, &b1_answer);
-    AddAssign::<&E::G1>::add_assign(&mut g_c, &h.wait()?);
-    AddAssign::<&E::G1>::add_assign(&mut g_c, &l.wait()?);
+    g_c.add_assign(&b1_answer);
+    g_c.add_assign(&h.wait()?);
+    g_c.add_assign(&l.wait()?);
 
     Ok(Proof {
         a: g_a.into_affine(),

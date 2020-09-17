@@ -1,11 +1,10 @@
 use super::multicore::Worker;
 use bit_vec::{self, BitVec};
-use ff::{Endianness, Field, PrimeField, ScalarEngine};
+use ff::{Field, PrimeField, PrimeFieldRepr, ScalarEngine};
 use futures::Future;
 use group::{CurveAffine, CurveProjective};
 use std::io;
 use std::iter;
-use std::ops::AddAssign;
 use std::sync::Arc;
 
 use super::SynthesisError;
@@ -19,23 +18,15 @@ pub trait SourceBuilder<G: CurveAffine>: Send + Sync + 'static + Clone {
 
 /// A source of bases, like an iterator.
 pub trait Source<G: CurveAffine> {
-    fn next(&mut self) -> Result<&G, SynthesisError>;
+    /// Parses the element from the source. Fails if the point is at infinity.
+    fn add_assign_mixed(
+        &mut self,
+        to: &mut <G as CurveAffine>::Projective,
+    ) -> Result<(), SynthesisError>;
 
     /// Skips `amt` elements from the source, avoiding deserialization.
     fn skip(&mut self, amt: usize) -> Result<(), SynthesisError>;
 }
-
-pub trait AddAssignFromSource: CurveProjective {
-    /// Parses the element from the source. Fails if the point is at infinity.
-    fn add_assign_from_source<S: Source<<Self as CurveProjective>::Affine>>(
-        &mut self,
-        source: &mut S,
-    ) -> Result<(), SynthesisError> {
-        AddAssign::<&<Self as CurveProjective>::Affine>::add_assign(self, source.next()?);
-        Ok(())
-    }
-}
-impl<G> AddAssignFromSource for G where G: CurveProjective {}
 
 impl<G: CurveAffine> SourceBuilder<G> for (Arc<Vec<G>>, usize) {
     type Source = (Arc<Vec<G>>, usize);
@@ -46,7 +37,10 @@ impl<G: CurveAffine> SourceBuilder<G> for (Arc<Vec<G>>, usize) {
 }
 
 impl<G: CurveAffine> Source<G> for (Arc<Vec<G>>, usize) {
-    fn next(&mut self) -> Result<&G, SynthesisError> {
+    fn add_assign_mixed(
+        &mut self,
+        to: &mut <G as CurveAffine>::Projective,
+    ) -> Result<(), SynthesisError> {
         if self.0.len() <= self.1 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -59,10 +53,11 @@ impl<G: CurveAffine> Source<G> for (Arc<Vec<G>>, usize) {
             return Err(SynthesisError::UnexpectedIdentity);
         }
 
-        let ret = &self.0[self.1];
+        to.add_assign_mixed(&self.0[self.1]);
+
         self.1 += 1;
 
-        Ok(ret)
+        Ok(())
     }
 
     fn skip(&mut self, amt: usize) -> Result<(), SynthesisError> {
@@ -154,16 +149,16 @@ fn multiexp_inner<Q, D, G, S>(
     pool: &Worker,
     bases: S,
     density_map: D,
-    exponents: Arc<Vec<<G::Engine as ScalarEngine>::Fr>>,
+    exponents: Arc<Vec<<<G::Engine as ScalarEngine>::Fr as PrimeField>::Repr>>,
     mut skip: u32,
     c: u32,
     handle_trivial: bool,
-) -> Box<dyn Future<Item = G, Error = SynthesisError>>
+) -> Box<Future<Item = <G as CurveAffine>::Projective, Error = SynthesisError>>
 where
     for<'a> &'a Q: QueryDensity,
     D: Send + Sync + 'static + Clone + AsRef<Q>,
-    G: CurveProjective,
-    S: SourceBuilder<<G as CurveProjective>::Affine>,
+    G: CurveAffine,
+    S: SourceBuilder<G>,
 {
     // Perform this region of the multiexp
     let this = {
@@ -173,44 +168,35 @@ where
 
         pool.compute(move || {
             // Accumulate the result
-            let mut acc = G::zero();
+            let mut acc = G::Projective::zero();
 
             // Build a source for the bases
             let mut bases = bases.new();
 
             // Create space for the buckets
-            let mut buckets = vec![G::zero(); (1 << c) - 1];
+            let mut buckets = vec![<G as CurveAffine>::Projective::zero(); (1 << c) - 1];
 
-            let one = <G::Engine as ScalarEngine>::Fr::one();
+            let zero = <G::Engine as ScalarEngine>::Fr::zero().into_repr();
+            let one = <G::Engine as ScalarEngine>::Fr::one().into_repr();
 
             // Sort the bases into buckets
             for (&exp, density) in exponents.iter().zip(density_map.as_ref().iter()) {
                 if density {
-                    if exp.is_zero() {
+                    if exp == zero {
                         bases.skip(1)?;
                     } else if exp == one {
                         if handle_trivial {
-                            acc.add_assign_from_source(&mut bases)?;
+                            bases.add_assign_mixed(&mut acc)?;
                         } else {
                             bases.skip(1)?;
                         }
                     } else {
-                        let mut exp = exp.to_repr();
-                        <<G::Engine as ScalarEngine>::Fr as PrimeField>::ReprEndianness::toggle_little_endian(&mut exp);
-
-                        let exp = exp
-                            .as_ref()
-                            .into_iter()
-                            .map(|b| (0..8).map(move |i| (b >> i) & 1u8))
-                            .flatten()
-                            .skip(skip as usize)
-                            .take(c as usize)
-                            .enumerate()
-                            .fold(0u64, |acc, (i, b)| acc + ((b as u64) << i));
+                        let mut exp = exp;
+                        exp.shr(skip);
+                        let exp = exp.as_ref()[0] % (1 << c);
 
                         if exp != 0 {
-                            (&mut buckets[(exp - 1) as usize])
-                                .add_assign_from_source(&mut bases)?;
+                            bases.add_assign_mixed(&mut buckets[(exp - 1) as usize])?;
                         } else {
                             bases.skip(1)?;
                         }
@@ -222,7 +208,7 @@ where
             // e.g. 3a + 2b + 1c = a +
             //                    (a) + b +
             //                    ((a) + b) + c
-            let mut running_sum = G::zero();
+            let mut running_sum = G::Projective::zero();
             for exp in buckets.into_iter().rev() {
                 running_sum.add_assign(&exp);
                 acc.add_assign(&running_sum);
@@ -250,7 +236,7 @@ where
                 c,
                 false,
             ))
-            .map(move |(this, mut higher): (_, G)| {
+            .map(move |(this, mut higher)| {
                 for _ in 0..c {
                     higher.double();
                 }
@@ -269,13 +255,13 @@ pub fn multiexp<Q, D, G, S>(
     pool: &Worker,
     bases: S,
     density_map: D,
-    exponents: Arc<Vec<<G::Engine as ScalarEngine>::Fr>>,
-) -> Box<dyn Future<Item = G, Error = SynthesisError>>
+    exponents: Arc<Vec<<<G::Engine as ScalarEngine>::Fr as PrimeField>::Repr>>,
+) -> Box<Future<Item = <G as CurveAffine>::Projective, Error = SynthesisError>>
 where
     for<'a> &'a Q: QueryDensity,
     D: Send + Sync + 'static + Clone + AsRef<Q>,
-    G: CurveProjective,
-    S: SourceBuilder<<G as CurveProjective>::Affine>,
+    G: CurveAffine,
+    S: SourceBuilder<G>,
 {
     let c = if exponents.len() < 32 {
         3u32
@@ -296,16 +282,16 @@ where
 #[cfg(feature = "pairing")]
 #[test]
 fn test_with_bls12() {
-    fn naive_multiexp<G: CurveProjective>(
-        bases: Arc<Vec<<G as CurveProjective>::Affine>>,
-        exponents: Arc<Vec<G::Scalar>>,
-    ) -> G {
+    fn naive_multiexp<G: CurveAffine>(
+        bases: Arc<Vec<G>>,
+        exponents: Arc<Vec<<G::Scalar as PrimeField>::Repr>>,
+    ) -> G::Projective {
         assert_eq!(bases.len(), exponents.len());
 
-        let mut acc = G::zero();
+        let mut acc = G::Projective::zero();
 
         for (base, exp) in bases.iter().zip(exponents.iter()) {
-            AddAssign::<&G>::add_assign(&mut acc, &base.mul(exp.to_repr()));
+            acc.add_assign(&base.mul(*exp));
         }
 
         acc
@@ -319,7 +305,7 @@ fn test_with_bls12() {
     let rng = &mut rand::thread_rng();
     let v = Arc::new(
         (0..SAMPLES)
-            .map(|_| <Bls12 as ScalarEngine>::Fr::random(rng))
+            .map(|_| <Bls12 as ScalarEngine>::Fr::random(rng).into_repr())
             .collect::<Vec<_>>(),
     );
     let g = Arc::new(
@@ -328,7 +314,7 @@ fn test_with_bls12() {
             .collect::<Vec<_>>(),
     );
 
-    let naive: <Bls12 as Engine>::G1 = naive_multiexp(g.clone(), v.clone());
+    let naive = naive_multiexp(g.clone(), v.clone());
 
     let pool = Worker::new();
 
